@@ -1,118 +1,153 @@
 package com.rolandas.rjtrader;
 
-import java.util.ArrayList;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.net.URISyntaxException;
+import java.net.URL;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentHashMap.KeySetView;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.stream.Collectors;
 
 public class Main {
 
-  public static void main(String[] args) throws InterruptedException {
-    List<Cowboy> cowboys =  new ArrayList<>();
+  public static void main(String[] args) throws InterruptedException, IOException {
 
-    AtomicBoolean startFlag = new AtomicBoolean(false);
-    AtomicBoolean endFlag = new AtomicBoolean(false);
-    cowboys.add(new Cowboy("John", 10, 1));
-    cowboys.add(new Cowboy("Bill", 8, 2));
-    cowboys.add(new Cowboy("Sam", 10, 1));
-    cowboys.add(new Cowboy("Peter", 5, 3));
-    cowboys.add(new Cowboy("Philip", 15, 1));
-    ExecutorService cowboysExecutor = Executors.newFixedThreadPool(5);
-    for (int i = 0; i < cowboys.size(); i++) {
-      final int cowboyIndex = i;
-      final Cowboy myself = cowboys.get(cowboyIndex);
-      final Random random = new Random();
-      cowboysExecutor.submit(() -> {
-        while(myself.isAlive() && !endFlag.get()){
-          if(!startFlag.get()) {
-            continue;
-          }
-          int shootIndex = random.nextInt(5);
-          if (shootIndex == cowboyIndex) {
-            continue;
-          }
-          Cowboy target = cowboys.get(shootIndex);
-          System.out.printf("%s shoot %s on %s damage%n", myself.getName(), target.getName(), myself.getDamage());
-          target.shoot(myself.getDamage());
-          try {
-            Thread.sleep(100);
-          } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-          }
-        }
-      });
+    URL url = ClassLoader.getSystemClassLoader().getResource("cowboys.json");
+    if(url == null) {
+      throw new IllegalStateException("File not found");
     }
+    ObjectMapper mapper = new ObjectMapper();
+    List<CowboyDTO> cowboysDTOs  = mapper.readValue(url, new TypeReference<>() {});
+    List<Cowboy> cowboys = cowboysDTOs.stream().map(CowboyDTO::asCowboy).toList();
+    Bar bar = new Bar(cowboys);
 
-    ExecutorService barmen = Executors.newSingleThreadExecutor();
-    barmen.submit(() -> {
-      System.out.println("Fight!!!!");
-      startFlag.set(true);
-      boolean lastManStanding = false;
-      while(!lastManStanding) {
-        List<Cowboy> aliveCowboys = cowboys.stream().filter(Cowboy::isAlive).toList();
-        if (aliveCowboys.size() == 1) {
-          System.out.printf("%s wins!", aliveCowboys.get(0).getName());
-          endFlag.set(true);
-          lastManStanding = true;
-        }
-      }
+    ExecutorService cowboysExecutor = Executors.newFixedThreadPool(cowboys.size());
+    cowboys.forEach(cowboy -> {
+      cowboy.enterBar(bar);
+      cowboysExecutor.submit(cowboy);
     });
 
-    barmen.awaitTermination(5l, TimeUnit.SECONDS);
+
+    boolean lastManStanding = false;
+    while(!lastManStanding) {
+      if (bar.isOnlyOneAlive()) {
+        System.out.printf("%s wins!", bar.getLastManStating().getName());
+        lastManStanding = true;
+      }
+      Thread.sleep(1000);
+    }
 
     cowboysExecutor.shutdown();
-    barmen.shutdown();
   }
 
+}
+class Bar {
+  private final KeySetView<Cowboy, Boolean> cowboys;
+  private final Random random = new Random();
 
+  public Bar(List<Cowboy> cowboys) {
+    this.cowboys = ConcurrentHashMap.newKeySet();
+    this.cowboys.addAll(cowboys);
+  }
 
+  public Cowboy pickCowboy(String shooterName) {
+    List<Cowboy> enemies = cowboys.stream()
+        .filter(cowboy -> !cowboy.getName().equals(shooterName))
+        .filter(Cowboy::isCowboyAlive)
+        .toList();
+    if (enemies.isEmpty()) {
+      return null;
+    }
+    return enemies.get(random.nextInt(enemies.size()));
+  }
 
+  public void removeCorpse(Cowboy cowboy) {
+    cowboys.remove(cowboy);
+  }
+
+  //In theory there is a race condition where both of the cowboys shoot each other at the same time, and we don't have a winner
+  public boolean isOnlyOneAlive() {
+    return this.cowboys.size() == 1;
+  }
+
+  public Cowboy getLastManStating() {
+    return (Cowboy) cowboys.toArray()[0];
+  }
 }
 
-class Cowboy {
+record CowboyDTO(String name, int health, int damage) {
+  public Cowboy asCowboy() {
+    return new Cowboy(this.name, this.health, this.damage);
+  }
+};
 
-  private String name;
+class Cowboy extends Thread {
+
   private int health;
-  private int damage;
+  private final int damage;
   private volatile boolean alive;
+  private Bar bar;
 
   public Cowboy(String name, int health, int damage) {
-    this.name = name;
+    super(name);
     this.health = health;
     this.damage = damage;
     this.alive = true;
   }
 
-  public synchronized boolean shoot(int damage) {
-    this.health = this.health - damage;
+  @Override
+  public void run() {
+    while (this.alive) {
+      try {
+        Cowboy target = bar.pickCowboy(this.getName());
+        if (target == null) {
+          break;
+        }
+        System.out.printf("%s shoot %s on %s damage%n", this.getName(), target.getName(), this.getDamage());
+        boolean success = target.tageDamage(this);
+        if (success) {
+            this.sleep(1000);
+        }
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+    }
+  }
+
+  public void enterBar(Bar bar) {
+      this.bar = bar;
+  }
+
+  public synchronized boolean tageDamage(Cowboy shooter) {
+    if(!this.alive) {
+      System.out.printf("Jeebers, someone got %s first%n", this.getName());
+      return false;
+    }
+    if(!shooter.isCowboyAlive()) {
+      System.out.printf("Shooter died first, %s lucky day%n", shooter.getName());
+      return false;
+    }
+    this.health = this.health - shooter.getDamage();
+    System.out.printf("%s has %s health left%n", this.getName(), this.health);
     if (this.health <= 0) {
       this.alive = false;
-      System.out.println(String.format("Cowboy %s died", this.name));
+      bar.removeCorpse(this);
+      System.out.printf("Cowboy %s died%n", this.getName());
     }
-    return this.alive;
-  }
-
-  public String getName() {
-    return name;
-  }
-
-  public int getHealth() {
-    return health;
+    return true;
   }
 
   public int getDamage() {
     return damage;
   }
 
-  public void setDamage(int damage) {
-    this.damage = damage;
-  }
 
-  public boolean isAlive() {
+  public boolean isCowboyAlive() {
     return alive;
   }
 }
